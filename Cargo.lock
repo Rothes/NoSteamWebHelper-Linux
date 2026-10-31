@@ -9,6 +9,7 @@ dependencies = [
  "ctrlc",
  "dbus",
  "libc",
+ "proc-connector",
  "sysinfo",
 ]
 
@@ -177,6 +178,15 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "proc-connector"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0e5eb14bec5d6c81b03a83c26110b5e07206102954b5809c07232cfcda1c0d"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "proc-macro2"

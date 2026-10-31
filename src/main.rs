@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 use dbus::blocking::Connection;
+use proc_connector::{ProcConnector, ProcEvent};
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, Signal, System, UpdateKind};
 
 struct ContainerProcessInfo {
@@ -115,17 +116,19 @@ fn monitor_game_proc_event() {
                         continue
                     }
 
+                    start_prevent_fork_swh();
                     let swh = get_steam_webhelper_processes(&mut sys);
-
-                    swh.first().map(|p| kwin_close_window(p.pid().as_u32()));
-                    sleep(Duration::from_millis(50));
+                    //
+                    // swh.first().map(|p| kwin_close_window(p.pid().as_u32()));
+                    // sleep(Duration::from_millis(50));
 
                     for proc in swh {
-                        if proc.status() != ProcessStatus::Run {
-                            continue
-                        }
-                        proc.kill_with(Signal::Stop);
-                        frozen_list.push(proc.pid().as_u32());
+                        // if proc.status() != ProcessStatus::Run {
+                        //     continue
+                        // }
+                        // proc.kill_with(Signal::Stop);
+                        // frozen_list.push(proc.pid().as_u32());
+                        proc.kill_with(Signal::Term);
                     }
 
                     println!("[no-steam-webhelper] freeze steamwebhelper");
@@ -149,6 +152,37 @@ fn monitor_game_proc_event() {
             }
         }
     }
+}
+
+fn start_prevent_fork_swh() {
+    std::thread::spawn(move || {
+        let conn = ProcConnector::new().unwrap();
+        if let Err(e) = conn.subscribe_filtered(proc_connector::EventMask::FORK) {
+            eprintln!("Failed to set EventMask: {}", e)
+        }
+        let mut buf = vec![0u8; 4096];
+
+        let pid = CONT_PROC.steam_process.load(Ordering::Relaxed);
+        loop {
+            match conn.recv(&mut buf) {
+                Ok(event) => {
+                    match event {
+                        ProcEvent::Fork { parent_pid, child_pid, .. } => {
+                            if pid != parent_pid {
+                                continue;
+                            }
+                            if !EXISTS_GAME_EXIT_MONITOR.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            unsafe { libc::kill(child_pid as i32, libc::SIGTERM); }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => eprintln!("error: {e:?}")
+            }
+        }
+    });
 }
 
 fn kwin_close_window(pid: u32) {
