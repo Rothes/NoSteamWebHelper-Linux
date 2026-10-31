@@ -20,11 +20,23 @@ static CONT_PROC: ContainerProcessInfo = ContainerProcessInfo { steam_process: A
 static FROZEN_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static EXISTS_GAME_EXIT_MONITOR: AtomicBool = AtomicBool::new(false);
 
+macro_rules! log {
+    ($($arg:tt)*) => {
+        println!("[no-steam-webhelper] {}", format_args!($($arg)*));
+    };
+}
+
+macro_rules! err {
+    ($($arg:tt)*) => {
+        println!("[no-steam-webhelper] {}", format_args!($($arg)*));
+    };
+}
+
 fn main() {
     launch_steam();
 
     if let Err(err) = ctrlc::set_handler(move || {
-        println!("[no-steam-webhelper] Caught exit signal");
+        log!("Caught exit signal");
         _cleanup();
         unsafe {
             let sys = create_sys();
@@ -34,7 +46,7 @@ fn main() {
         };
         std::process::exit(0);
     }) {
-        eprintln!("[no-steam-webhelper] Failed to set ctrlc handler: {}", err);
+        err!("Failed to set ctrlc handler: {}", err);
     }
 
     monitor_game_proc_event();
@@ -45,7 +57,7 @@ fn main() {
 fn launch_steam() {
     let mut child = Command::new("/usr/bin/steam").args(std::env::args().skip(1)).spawn().expect("Failed to launch steam");
     STEAM_ROOT_PID.store(child.id(), Ordering::Relaxed);
-    println!("[no-steam-webhelper] Launching steam steam pid {}", child.id());
+    log!("Launching steam steam pid {}", child.id());
 
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -57,7 +69,7 @@ fn launch_steam() {
 fn _cleanup() {
     let sys = create_sys();
     continue_frozen(&sys);
-    println!("[no-steam-webhelper] Running cleanup");
+    log!("Running cleanup");
 }
 
 fn continue_frozen(system: &System) {
@@ -105,7 +117,7 @@ fn monitor_game_proc_event() {
 
                     let mut sys = create_sys();
                     if !check_steam_container_proc(sys.processes()) {
-                        println!("[no-steam-webhelper] Bad steam container processes");
+                        log!("Bad steam container processes");
                         continue
                     }
 
@@ -131,7 +143,7 @@ fn monitor_game_proc_event() {
                         proc.kill_with(Signal::Term);
                     }
 
-                    println!("[no-steam-webhelper] freeze steamwebhelper");
+                    log!("freeze steamwebhelper");
                 }
                 // "ProcessExited" => {
                 //     if !frozen {
@@ -146,7 +158,7 @@ fn monitor_game_proc_event() {
                 //
                 //     continue_frozen(&sys);
                 //     frozen = false;
-                //     println!("[no-steam-webhelper] continue steamwebhelper");
+                //     log!("continue steamwebhelper");
                 // }
                 _ => {}
             }
@@ -158,7 +170,7 @@ fn start_prevent_fork_swh() {
     std::thread::spawn(move || {
         let conn = ProcConnector::new().unwrap();
         if let Err(e) = conn.subscribe_filtered(proc_connector::EventMask::FORK) {
-            eprintln!("Failed to set EventMask: {}", e)
+            err!("Failed to set EventMask: {}", e);
         }
         let mut buf = vec![0u8; 4096];
 
@@ -179,7 +191,7 @@ fn start_prevent_fork_swh() {
                         _ => {}
                     }
                 }
-                Err(e) => eprintln!("error: {e:?}")
+                Err(e) => { err!("error: {e:?}"); }
             }
         }
     });
@@ -208,7 +220,7 @@ fn kwin_close_window(pid: u32) {
     let script_id: i32;
     (script_id,) = scripting.method_call("org.kde.kwin.Scripting", "loadScript", (path.to_string_lossy(), &script_name)).unwrap_or((-555,));
     if script_id < 0 {
-        eprintln!("[no-steam-webhelper] Failed to loadScript");
+        err!("Failed to loadScript");
         return;
     }
     let loaded = conn.with_proxy(
@@ -249,13 +261,13 @@ fn start_monitor_game_exit(pid: u32) {
             };
 
             if ret < 0 {
-                eprintln!("[no-steam-webhelper] pollfd failed");
+                err!("pollfd failed");
             }
         } else {
-            eprintln!("[no-steam-webhelper] pidfd_open failed");
+            err!("pidfd_open failed");
         }
 
-        eprintln!("[no-steam-webhelper] Game process {pid} exited");
+        err!("Game process {pid} exited");
         EXISTS_GAME_EXIT_MONITOR.store(false, Ordering::Relaxed);
 
         let sys = create_sys();
@@ -270,7 +282,7 @@ fn start_monitor_game_exit(pid: u32) {
         }
 
         continue_frozen(&sys);
-        println!("[no-steam-webhelper] continue steamwebhelper");
+        log!("continue steamwebhelper");
     });
 }
 
@@ -315,7 +327,7 @@ fn check_steam_container_proc(proc: &HashMap<Pid, Process>) -> bool {
             }
         }
         if ok == 2 {
-            println!("[no-steam-webhelper] webhelper parent pid: {}, launcher pid: {}", CONT_PROC.steam_process.load(Ordering::Relaxed), CONT_PROC.launcher_process.load(Ordering::Relaxed));
+            log!("webhelper parent pid: {}, launcher pid: {}", CONT_PROC.steam_process.load(Ordering::Relaxed), CONT_PROC.launcher_process.load(Ordering::Relaxed));
         }
         ok == 2
     } else {
@@ -332,7 +344,7 @@ fn game_running(proc: &HashMap<Pid, Process>) -> Option<u32> {
     let find = proc.values().find(|p| p.parent().map_or(false, |pp| pp.as_u32() == ppid_expected) && p.name().to_str().unwrap().contains("steam-runtime"));
 
     if let Some(proc) = find {
-        println!("[no-steam-webhelper] Currently running game: {:?}", proc);
+        log!("Currently running game: {:?}", proc);
         Some(proc.pid().as_u32())
     } else {
         None
