@@ -13,29 +13,21 @@ struct ContainerProcessInfo {
     launcher_process: AtomicU32,
 }
 
+static STEAM_ROOT_PID: AtomicU32 = AtomicU32::new(0);
+
 static CONT_PROC: ContainerProcessInfo = ContainerProcessInfo { steam_process: AtomicU32::new(0), launcher_process: AtomicU32::new(0) };
 static FROZEN_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static EXISTS_GAME_EXIT_MONITOR: AtomicBool = AtomicBool::new(false);
 
 fn main() {
-    let mut child = Command::new("/usr/bin/steam").args(std::env::args().skip(1)).spawn().expect("Failed to launch steam");
-    let steam_pid = child.id();
-    {
-        println!("[no-steam-webhelper] Launching steam steam pid {}", steam_pid);
-
-        std::thread::spawn(move || {
-            let _ = child.wait();
-            _cleanup();
-            std::process::exit(0);
-        });
-    }
+    launch_steam();
 
     if let Err(err) = ctrlc::set_handler(move || {
         println!("[no-steam-webhelper] Caught exit signal");
         _cleanup();
         unsafe {
             let sys = create_sys();
-            if check_steam_container_proc(sys.processes(), steam_pid) {
+            if check_steam_container_proc(sys.processes()) {
                 libc::kill(CONT_PROC.steam_process.load(Ordering::Relaxed) as i32, libc::SIGTERM);
             }
         };
@@ -44,9 +36,21 @@ fn main() {
         eprintln!("[no-steam-webhelper] Failed to set ctrlc handler: {}", err);
     }
 
-    monitor_game_proc_event(steam_pid);
+    monitor_game_proc_event();
     _cleanup();
     panic!("Huh?")
+}
+
+fn launch_steam() {
+    let mut child = Command::new("/usr/bin/steam").args(std::env::args().skip(1)).spawn().expect("Failed to launch steam");
+    STEAM_ROOT_PID.store(child.id(), Ordering::Relaxed);
+    println!("[no-steam-webhelper] Launching steam steam pid {}", child.id());
+
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        _cleanup();
+        std::process::exit(0);
+    });
 }
 
 fn _cleanup() {
@@ -63,7 +67,7 @@ fn continue_frozen(system: &System) {
     list.clear();
 }
 
-fn monitor_game_proc_event(steam_root: u32) {
+fn monitor_game_proc_event() {
     let conn = Connection::new_session().expect("Failed to connect to DBus");
 
     let _: () = conn.with_proxy(
@@ -99,14 +103,14 @@ fn monitor_game_proc_event(steam_root: u32) {
                     }
 
                     let mut sys = create_sys();
-                    if !check_steam_container_proc(sys.processes(), steam_root) {
+                    if !check_steam_container_proc(sys.processes()) {
                         println!("[no-steam-webhelper] Bad steam container processes");
                         continue
                     }
 
                     let mut frozen_list = FROZEN_PROC.lock().unwrap();
                     if let Some(pid) = game_running(sys.processes()) {
-                        start_monitor_game_exit(pid, steam_root);
+                        start_monitor_game_exit(pid);
                     } else {
                         continue
                     }
@@ -184,7 +188,7 @@ fn kwin_close_window(pid: u32) {
     let _ = std::fs::remove_file(path);
 }
 
-fn start_monitor_game_exit(pid: u32, steam_root: u32) {
+fn start_monitor_game_exit(pid: u32) {
     if !EXISTS_GAME_EXIT_MONITOR.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         return;
     }
@@ -222,12 +226,12 @@ fn start_monitor_game_exit(pid: u32, steam_root: u32) {
 
         let sys = create_sys();
 
-        if !check_steam_container_proc(sys.processes(), steam_root) {
+        if !check_steam_container_proc(sys.processes()) {
             return; // Exit?
         }
 
         if let Some(pid) = game_running(sys.processes()) {
-            start_monitor_game_exit(pid, steam_root);
+            start_monitor_game_exit(pid);
             return;
         }
 
@@ -240,7 +244,7 @@ fn create_sys() -> System {
     System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing())).unwrap()
 }
 
-fn check_steam_container_proc(proc: &HashMap<Pid, Process>, _steam_root: u32) -> bool {
+fn check_steam_container_proc(proc: &HashMap<Pid, Process>) -> bool {
     macro_rules! find_children {
         ($pid:expr) => {
             proc.values().filter(|process| process.parent().as_ref() == Some($pid))
