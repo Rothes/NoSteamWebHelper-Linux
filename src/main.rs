@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 use dbus::blocking::Connection;
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, Signal, System, UpdateKind};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, Signal, System, UpdateKind};
 
 struct ContainerProcessInfo {
     steam_process: AtomicU32,
@@ -115,7 +115,11 @@ fn monitor_game_proc_event(steam_root: u32) {
 
                     swh.first().map(|p| kwin_close_window(p.pid().as_u32()));
                     sleep(Duration::from_millis(50));
+
                     for proc in swh {
+                        if proc.status() != ProcessStatus::Run {
+                            continue
+                        }
                         proc.kill_with(Signal::Stop);
                         frozen_list.push(proc.pid().as_u32());
                     }
