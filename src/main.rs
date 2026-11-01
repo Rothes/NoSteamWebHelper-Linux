@@ -1,24 +1,22 @@
-use std::collections::HashMap;
-use std::os::fd::{FromRawFd, OwnedFd};
+use proc_connector::{EventMask, ProcConnector, ProcEvent};
+use std::collections::HashSet;
+use std::process;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::thread::sleep;
-use std::time::Duration;
-use dbus::blocking::Connection;
-use proc_connector::{ProcConnector, ProcEvent};
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, Signal, System, UpdateKind};
-
-struct ContainerProcessInfo {
-    steam_process: AtomicU32,
-    launcher_process: AtomicU32,
-}
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread::{Thread, park};
 
 static STEAM_ROOT_PID: AtomicU32 = AtomicU32::new(0);
+static STEAM_CLIENT_PID: AtomicU32 = AtomicU32::new(0);
+static WEBHELPER_PID: AtomicU32 = AtomicU32::new(0);
 
-static CONT_PROC: ContainerProcessInfo = ContainerProcessInfo { steam_process: AtomicU32::new(0), launcher_process: AtomicU32::new(0) };
 static FROZEN_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-static EXISTS_GAME_EXIT_MONITOR: AtomicBool = AtomicBool::new(false);
+
+static GAME_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+static BLOCK_WEBHELPER: AtomicBool = AtomicBool::new(false);
+
+static MAIN_THREAD: Mutex<Option<Thread>> = Mutex::new(None);
 
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -33,160 +31,122 @@ macro_rules! err {
 }
 
 fn main() {
+    {
+        let mut guard = MAIN_THREAD.lock().unwrap();
+        *guard = Some(std::thread::current());
+    }
+    start_proc_connector();
     launch_steam();
 
     if let Err(err) = ctrlc::set_handler(move || {
         log!("Caught exit signal");
-        _cleanup();
-        unsafe {
-            let sys = create_sys();
-            if check_steam_container_proc(sys.processes()) {
-                libc::kill(CONT_PROC.steam_process.load(Ordering::Relaxed) as i32, libc::SIGTERM);
-            }
-        };
-        std::process::exit(0);
+        continue_main();
     }) {
         err!("Failed to set ctrlc handler: {}", err);
     }
 
-    monitor_game_proc_event();
-    _cleanup();
-    panic!("Huh?")
+    park();
+    cleanup();
+    log!("Program exits");
 }
 
-fn launch_steam() {
-    let mut child = Command::new("/usr/bin/steam").args(std::env::args().skip(1)).spawn().expect("Failed to launch steam");
-    STEAM_ROOT_PID.store(child.id(), Ordering::Relaxed);
-    log!("Launching steam steam pid {}", child.id());
+fn start_proc_connector() {
+    let conn = ProcConnector::new().expect("failed to create process connector");
+    if let Err(e) = conn.subscribe_filtered(EventMask::EXEC | EventMask::EXIT) {
+        err!("Failed to set EventMask: {}", e);
+    }
+    let mut buf = vec![0u8; 4096];
+
+    let mut launching_pids: HashSet<u32> = HashSet::new();
+    launching_pids.insert(process::id());
+    let mut steam_client_pid = 0u32; // no-steam-webhelper -> bash -> steam -> srt-client-container -> srt-bwrap -> pv-adverb -> steam
+    let mut steam_launcher_pid = 0u32;
 
     std::thread::spawn(move || {
-        let _ = child.wait();
-        _cleanup();
-        std::process::exit(0);
-    });
-}
-
-fn _cleanup() {
-    let sys = create_sys();
-    continue_frozen(&sys);
-    log!("Running cleanup");
-}
-
-fn continue_frozen(system: &System) {
-    let mut list = FROZEN_PROC.lock().unwrap();
-    list.iter().for_each(|pid| {
-        system.process(Pid::from_u32(*pid)).map(|p| p.kill_with(Signal::Continue));
-    });
-    list.clear();
-}
-
-fn monitor_game_proc_event() {
-    let conn = Connection::new_session().expect("Failed to connect to DBus");
-
-    let _: () = conn.with_proxy(
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        Duration::from_secs(5),
-    ).method_call(
-        "org.freedesktop.DBus.Monitoring",
-        "BecomeMonitor",
-        (vec!["interface='com.steampowered.PressureVessel.Launcher1'"], 0u32),
-    ).expect("Failed to BecomeMonitor");
-
-    // Skip the first two signal, NameAcquired for conn dbus and NameLost for BecomeMonitor
-    for _ in 0..2 {
-        conn.channel().blocking_pop_message(Duration::MAX).unwrap();
-    }
-
-    let steam_path = Some(&format!("{}/.local/share/Steam\0", std::env::var("HOME").unwrap()).into_bytes());
-
-    while let Some(msg) = conn.channel().blocking_pop_message(Duration::MAX).unwrap() {
-        if let Some(member) = msg.member() {
-            match member.as_ref() {
-                "Launch" => {
-                    if msg.iter_init().get().as_ref() == steam_path {
-                        // This calls even not playing a game,
-                        // or calls and exits before actual game launches.
-                        // Should ignore for game process launch detect.
-                        continue
-                    }
-
-                    if EXISTS_GAME_EXIT_MONITOR.load(Ordering::Relaxed) {
-                        continue
-                    }
-
-                    let mut sys = create_sys();
-                    if !check_steam_container_proc(sys.processes()) {
-                        log!("Bad steam container processes");
-                        continue
-                    }
-
-                    let mut frozen_list = FROZEN_PROC.lock().unwrap();
-                    if let Some(pid) = game_running(sys.processes()) {
-                        start_monitor_game_exit(pid);
-                    } else {
-                        continue
-                    }
-
-                    start_prevent_fork_swh();
-                    let swh = get_steam_webhelper_processes(&mut sys);
-                    //
-                    // swh.first().map(|p| kwin_close_window(p.pid().as_u32()));
-                    // sleep(Duration::from_millis(50));
-
-                    for proc in swh {
-                        // if proc.status() != ProcessStatus::Run {
-                        //     continue
-                        // }
-                        // proc.kill_with(Signal::Stop);
-                        // frozen_list.push(proc.pid().as_u32());
-                        proc.kill_with(Signal::Term);
-                    }
-
-                    log!("freeze steamwebhelper");
-                }
-                // "ProcessExited" => {
-                //     if !frozen {
-                //         continue
-                //     }
-                //
-                //     let sys = create_sys();
-                //
-                //     if !check_steam_container_proc(sys.processes(), steam_root) || has_game_running(sys.processes()) {
-                //         continue
-                //     }
-                //
-                //     continue_frozen(&sys);
-                //     frozen = false;
-                //     log!("continue steamwebhelper");
-                // }
-                _ => {}
-            }
-        }
-    }
-}
-
-fn start_prevent_fork_swh() {
-    std::thread::spawn(move || {
-        let conn = ProcConnector::new().unwrap();
-        if let Err(e) = conn.subscribe_filtered(proc_connector::EventMask::FORK) {
-            err!("Failed to set EventMask: {}", e);
-        }
-        let mut buf = vec![0u8; 4096];
-
-        let pid = CONT_PROC.steam_process.load(Ordering::Relaxed);
         loop {
             match conn.recv(&mut buf) {
                 Ok(event) => {
                     match event {
-                        ProcEvent::Fork { parent_pid, child_pid, .. } => {
-                            if pid != parent_pid {
-                                continue;
+                        ProcEvent::Exec { pid, .. } => {
+                            if steam_client_pid == 0 || steam_launcher_pid == 0 {
+                                if let Some(ppid) = get_proc_parent(pid) {
+                                    if launching_pids.contains(&ppid) {
+                                        launching_pids.insert(pid);
+                                        if let Some(comm) = get_proc_comm(pid) {
+                                            match comm.as_str() {
+                                                "x86_64-linux-gn" /* x86_64-linux-gnu-srt-launcher-service */ => {
+                                                    if steam_launcher_pid == 0 {
+                                                        steam_launcher_pid = pid;
+                                                        log!("steam_launcher_pid is {}", pid);
+                                                    }
+                                                }
+                                                "steam" => {
+                                                    if let Some(ppid) = get_proc_parent(pid) && get_proc_comm(ppid) == Some("pv-adverb".to_string()) {
+                                                        if steam_client_pid == 0 {
+                                                            steam_client_pid = pid;
+                                                            STEAM_CLIENT_PID.store(pid, Ordering::Relaxed);
+                                                            log!("steam_client_pid is {}", pid);
+                                                            launching_pids.clear();
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Some(ppid) = get_proc_parent(pid) {
+                                    if ppid == steam_launcher_pid {
+                                        if get_proc_comm(pid).map_or(false, |s| s.contains("steam-runtime")) {
+                                            GAME_PROC.lock().unwrap().push(pid);
+                                            on_game_start();
+                                            log!("Game {pid} started");
+                                        }
+                                    } else if ppid == steam_client_pid {
+                                        if get_proc_comm(pid).map_or(false, |s| s.eq("steamwebhelper")) {
+                                            if BLOCK_WEBHELPER.load(Ordering::Relaxed) {
+                                                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                                            } else {
+                                                // We only store the root process of steam web helper
+                                                // Term the root process kills all of them
+                                                WEBHELPER_PID.store(pid, Ordering::Relaxed);
+                                                log!("webhelper_pid is {}", pid);
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            if !EXISTS_GAME_EXIT_MONITOR.load(Ordering::Relaxed) {
+                        }
+                        ProcEvent::Exit { parent_pid, pid, .. } => {
+                            fn rm_elem(pids: &Mutex<Vec<u32>>, pid: u32) -> bool {
+                                let mut vec = pids.lock().unwrap();
+                                if let Some(pos) = vec.iter().position(|&x| x == pid) {
+                                    vec.remove(pos);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            if steam_client_pid == 0 || steam_launcher_pid == 0 {
+                                if launching_pids.remove(&pid) && launching_pids.len() == 1 {
+                                    // All steam processes exited
+                                    continue_main();
+                                    return;
+                                }
+                            } else if parent_pid == steam_client_pid && pid == WEBHELPER_PID.load(Ordering::Relaxed) {
+                                WEBHELPER_PID.store(0, Ordering::Relaxed);
+                                log!("webhelper_pid {pid} exited");
+                            } else if parent_pid == steam_launcher_pid {
+                                if rm_elem(&GAME_PROC, pid) {
+                                    on_game_exit();
+                                    log!("Game {pid} exited");
+                                }
+                            } else if pid == steam_client_pid {
+                                log!("Steam client {pid} exited");
+                                continue_main();
                                 return;
                             }
-                            unsafe { libc::kill(child_pid as i32, libc::SIGTERM); }
                         }
                         _ => {}
                     }
@@ -197,189 +157,117 @@ fn start_prevent_fork_swh() {
     });
 }
 
-fn kwin_close_window(pid: u32) {
-    let script = format!(
-        r#"
-            const targetPid = {pid};
-            const wins = workspace.windowList();
 
-            for (const win of wins) {{
-                if (win.pid === targetPid && win.closeable) {{
-                    win.closeWindow();
-                }}
-            }}
-        "#
-    );
-    let script_name = format!("no-steam-webhelper-close-script-tmp-{pid}");
-
-    let path = std::env::temp_dir().join("no-steam-webhelper-close-script.tmp.js");
-    std::fs::write(&path, script).unwrap();
-
-    let conn = Connection::new_session().unwrap();
-    let scripting = conn.with_proxy("org.kde.KWin", "/Scripting", Duration::from_secs(10));
-    let script_id: i32;
-    (script_id,) = scripting.method_call("org.kde.kwin.Scripting", "loadScript", (path.to_string_lossy(), &script_name)).unwrap_or((-555,));
-    if script_id < 0 {
-        err!("Failed to loadScript");
-        return;
-    }
-    let loaded = conn.with_proxy(
-        "org.kde.KWin",
-        format!("/Scripting/Script{script_id}"),
-        Duration::from_secs(10),
-    );
-    let _: () = loaded.method_call("org.kde.kwin.Script", "run", ()).unwrap();
-    let _: () = loaded.method_call("org.kde.kwin.Script", "stop", ()).unwrap();
-    let _: () = scripting.method_call("org.kde.kwin.Scripting", "unloadScript", (&script_name,)).unwrap();
-    let _ = std::fs::remove_file(path);
+fn get_proc_parent(pid: u32) -> Option<u32> {
+    let path = format!("/proc/{}/stat", pid);
+    let content = std::fs::read_to_string(path).ok()?;
+    let ppid_start = content.rfind(')')? + 4;
+    let ppid = &content[ppid_start..];
+    let ppid_end = ppid.find(' ')?;
+    ppid[..ppid_end].parse().ok()
 }
 
-fn start_monitor_game_exit(pid: u32) {
-    if !EXISTS_GAME_EXIT_MONITOR.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        return;
+// fn get_proc_exe(pid: u32) -> Option<PathBuf> {
+//     let path = format!("/proc/{}/exe", pid);
+//     std::fs::read_link(path).ok()
+// }
+//
+// fn get_exe_path(path: &Option<PathBuf>) -> Option<String> {
+//     path.as_deref().and_then(|p| p.to_str()).map(String::from)
+// }
+//
+// fn matches_file_name(path: &PathBuf, name: &str) -> bool {
+//     path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n == name)
+// }
+//
+// fn get_proc_cmdline(pid: u32) -> Option<String> {
+//     let path = format!("/proc/{}/cmdline", pid);
+//     std::fs::read_to_string(path).ok()
+// }
+
+fn get_proc_comm(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/comm", pid);
+    std::fs::read_to_string(path).map(|s| s.trim().to_string()).ok()
+}
+
+fn launch_steam() {
+    let child = Command::new("/usr/bin/steam").args(std::env::args().skip(1)).spawn().expect("Failed to launch steam");
+    STEAM_ROOT_PID.store(child.id(), Ordering::Relaxed);
+    log!("Launching steam steam pid {}", child.id());
+}
+
+fn continue_main() {
+    if let Some(thread) = MAIN_THREAD.lock().unwrap().clone() {
+        thread.unpark();
     }
-    std::thread::spawn(move || {
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_open,
-                pid as libc::pid_t,
-                0,
-            ) as i32
-        };
+}
 
-        if fd >= 0 {
-            let _pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+fn cleanup() {
+    log!("Running cleanup");
+    continue_frozen();
+    let pid = STEAM_CLIENT_PID.load(Ordering::Relaxed);
+    if pid != 0 {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+    }
+}
 
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
+fn on_game_start() {
+    if BLOCK_WEBHELPER.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        log!("Starting game mode");
+        let webhelper_pid = WEBHELPER_PID.load(Ordering::Relaxed);
+        unsafe { libc::kill(webhelper_pid as i32, libc::SIGTERM); }
+        // ProcConnector will capture the proc exit
+    }
+}
 
-            let ret = unsafe {
-                libc::poll(&mut pfd, 1, -1)
-            };
+fn on_game_exit() {
+    if GAME_PROC.lock().unwrap().is_empty() && BLOCK_WEBHELPER.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        log!("Exiting game mode");
+        continue_frozen()
+    }
+}
 
-            if ret < 0 {
-                err!("pollfd failed");
-            }
-        } else {
-            err!("pidfd_open failed");
-        }
-
-        err!("Game process {pid} exited");
-        EXISTS_GAME_EXIT_MONITOR.store(false, Ordering::Relaxed);
-
-        let sys = create_sys();
-
-        if !check_steam_container_proc(sys.processes()) {
-            return; // Exit?
-        }
-
-        if let Some(pid) = game_running(sys.processes()) {
-            start_monitor_game_exit(pid);
-            return;
-        }
-
-        continue_frozen(&sys);
-        log!("continue steamwebhelper");
+fn continue_frozen() {
+    let mut wh = FROZEN_PROC.lock().unwrap();
+    wh.iter().for_each(|&pid| {
+        unsafe { libc::kill(pid as i32, libc::SIGCONT); }
     });
+    wh.clear();
 }
 
-fn create_sys() -> System {
-    System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing())).unwrap()
-}
-
-fn check_steam_container_proc(proc: &HashMap<Pid, Process>) -> bool {
-    macro_rules! find_children {
-        ($pid:expr) => {
-            proc.values().filter(|process| process.parent().as_ref() == Some($pid))
-        };
-    }
-    if !check_proc_running(proc, &CONT_PROC.steam_process) || !check_proc_running(proc, &CONT_PROC.launcher_process) {
-        let mut ok: u8 = 0;
-
-        if let Some(container_entry) = proc.iter().find(|(_, process)| {
-            process.name() == "srt-client-cont" /* srt-client-container */ && if let Some(ppid) = process.parent() {
-                proc.get(&ppid).map_or(false, |p| p.name() == "steam")
-            } else { false }
-        }) {
-            for p in find_children!(container_entry.0) {
-                match p.name().to_str().unwrap() {
-                    "x86_64-linux-gn" /* x86_64-linux-gnu-srt-launcher-service */ => {
-                        CONT_PROC.launcher_process.store(p.pid().as_u32(), Ordering::Relaxed);
-                        ok += 1;
-                    }
-                    "srt-bwrap" => {
-                        for p in find_children!(&p.pid()) {
-                            if p.name() == "pv-adverb" {
-                                for p in find_children!(&p.pid()) {
-                                    if p.name() == "steam" {
-                                        CONT_PROC.steam_process.store(p.pid().as_u32(), Ordering::Relaxed);
-                                        ok += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if ok == 2 {
-            log!("webhelper parent pid: {}, launcher pid: {}", CONT_PROC.steam_process.load(Ordering::Relaxed), CONT_PROC.launcher_process.load(Ordering::Relaxed));
-        }
-        ok == 2
-    } else {
-        true
-    }
-}
-
-fn check_proc_running(proc: &HashMap<Pid, Process>, pid: &AtomicU32) -> bool {
-    proc.contains_key(&Pid::from_u32(pid.load(Ordering::Relaxed)))
-}
-
-fn game_running(proc: &HashMap<Pid, Process>) -> Option<u32> {
-    let ppid_expected = CONT_PROC.launcher_process.load(Ordering::Relaxed);
-    let find = proc.values().find(|p| p.parent().map_or(false, |pp| pp.as_u32() == ppid_expected) && p.name().to_str().unwrap().contains("steam-runtime"));
-
-    if let Some(proc) = find {
-        log!("Currently running game: {:?}", proc);
-        Some(proc.pid().as_u32())
-    } else {
-        None
-    }
-}
-
-fn get_steam_webhelper_processes(sys: &mut System) -> Vec<&Process> {
-    let ppid_expected = CONT_PROC.steam_process.load(Ordering::Relaxed);
-    let mut possible_pids = Vec::new();
-    let mut ppid = vec![ppid_expected];
-
-    while let Some(parent) = ppid.pop() {
-        for (pid, p) in sys.processes() {
-            if p.parent().map_or(false, |pp| pp.as_u32() == parent) {
-                possible_pids.push(*pid);
-                ppid.push(pid.as_u32());
-            }
-        }
-    }
-
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&possible_pids), false, ProcessRefreshKind::nothing().with_exe(UpdateKind::Always));
-
-    let mut webhelper_proc = Vec::new();
-    for pid in possible_pids {
-        if let Some(p) = sys.process(pid) {
-            let is_webhelper = p.exe()
-                .and_then(|e| e.file_name())
-                .and_then(|s| s.to_str())
-                .map_or(false, |name| name == "steamwebhelper");
-
-            if is_webhelper {
-                webhelper_proc.push(p);
-            }
-        }
-    }
-
-    webhelper_proc
-}
+// fn kwin_close_window(pid: u32) {
+//     let script = format!(
+//         r#"
+//             const targetPid = {pid};
+//             const wins = workspace.windowList();
+//
+//             for (const win of wins) {{
+//                 if (win.pid === targetPid && win.closeable) {{
+//                     win.closeWindow();
+//                 }}
+//             }}
+//         "#
+//     );
+//     let script_name = format!("no-steam-webhelper-close-script-tmp-{pid}");
+//
+//     let path = std::env::temp_dir().join("no-steam-webhelper-close-script.tmp.js");
+//     std::fs::write(&path, script).unwrap();
+//
+//     let conn = dbus::blocking::Connection::new_session().unwrap();
+//     let scripting = conn.with_proxy("org.kde.KWin", "/Scripting", Duration::from_secs(10));
+//     let script_id: i32;
+//     (script_id,) = scripting.method_call("org.kde.kwin.Scripting", "loadScript", (path.to_string_lossy(), &script_name)).unwrap_or((-555,));
+//     if script_id < 0 {
+//         err!("Failed to loadScript");
+//         return;
+//     }
+//     let loaded = conn.with_proxy(
+//         "org.kde.KWin",
+//         format!("/Scripting/Script{script_id}"),
+//         Duration::from_secs(10),
+//     );
+//     let _: () = loaded.method_call("org.kde.kwin.Script", "run", ()).unwrap();
+//     let _: () = loaded.method_call("org.kde.kwin.Script", "stop", ()).unwrap();
+//     let _: () = scripting.method_call("org.kde.kwin.Scripting", "unloadScript", (&script_name,)).unwrap();
+//     let _ = std::fs::remove_file(path);
+// }

@@ -6,7 +6,5 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 dbus = "0.9.12"
-sysinfo = "0.40.0"
 ctrlc = "3.5.2"
-
 proc-connector = "0.3.0"
