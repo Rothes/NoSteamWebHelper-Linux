@@ -63,56 +63,75 @@ fn start_proc_connector() {
     let mut steam_launcher_pid = 0u32;
 
     std::thread::spawn(move || {
+        // Catch steam pid
         loop {
             match conn.recv(&mut buf) {
                 Ok(event) => {
                     match event {
                         ProcEvent::Exec { pid, .. } => {
-                            if steam_client_pid == 0 || steam_launcher_pid == 0 {
-                                if let Some(ppid) = get_proc_parent(pid) {
-                                    if launching_pids.contains(&ppid) {
-                                        launching_pids.insert(pid);
-                                        if let Some(comm) = get_proc_comm(pid) {
-                                            match comm.as_str() {
-                                                "x86_64-linux-gn" /* x86_64-linux-gnu-srt-launcher-service */ => {
-                                                    if steam_launcher_pid == 0 {
-                                                        steam_launcher_pid = pid;
-                                                        log!("steam_launcher_pid is {}", pid);
-                                                    }
+                            if let Some(ppid) = get_proc_parent(pid) {
+                                if launching_pids.contains(&ppid) {
+                                    launching_pids.insert(pid);
+                                    if let Some(comm) = get_proc_comm(pid) {
+                                        match comm.as_str() {
+                                            "x86_64-linux-gn" /* x86_64-linux-gnu-srt-launcher-service */ => {
+                                                if steam_launcher_pid == 0 {
+                                                    steam_launcher_pid = pid;
+                                                    log!("steam_launcher_pid is {}", pid);
                                                 }
-                                                "steam" => {
-                                                    if let Some(ppid) = get_proc_parent(pid) && get_proc_comm(ppid) == Some("pv-adverb".to_string()) {
-                                                        if steam_client_pid == 0 {
-                                                            steam_client_pid = pid;
-                                                            STEAM_CLIENT_PID.store(pid, Ordering::Relaxed);
-                                                            log!("steam_client_pid is {}", pid);
-                                                            launching_pids.clear();
-                                                        }
-                                                    }
-                                                }
-                                                _ => {}
                                             }
+                                            "steam" => {
+                                                if let Some(ppid) = get_proc_parent(pid) && get_proc_comm(ppid) == Some("pv-adverb".to_string()) {
+                                                    if steam_client_pid == 0 {
+                                                        steam_client_pid = pid;
+                                                        STEAM_CLIENT_PID.store(pid, Ordering::Relaxed);
+                                                        log!("steam_client_pid is {}", pid);
+                                                        drop(launching_pids);
+                                                        break
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
-                            } else {
-                                if let Some(ppid) = get_proc_parent(pid) {
-                                    if ppid == steam_launcher_pid {
-                                        if get_proc_comm(pid).map_or(false, |s| s.contains("steam-runtime")) {
-                                            GAME_PROC.lock().unwrap().push(pid);
-                                            on_game_start();
-                                            log!("Game {pid} started");
-                                        }
-                                    } else if ppid == steam_client_pid {
-                                        if get_proc_comm(pid).map_or(false, |s| s.eq("steamwebhelper")) {
-                                            if BLOCK_WEBHELPER.load(Ordering::Relaxed) {
-                                                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-                                            } else {
-                                                // We only store the root process of steam web helper
-                                                // Term the root process kills all of them
-                                                WEBHELPER_PID.store(pid, Ordering::Relaxed);
-                                                log!("webhelper_pid is {}", pid);
-                                            }
+                            }
+                        }
+                        ProcEvent::Exit { pid, .. } => {
+                            if launching_pids.remove(&pid) && launching_pids.len() == 1 {
+                                // All steam processes exited
+                                continue_main();
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => { err!("error: {e:?}"); }
+            }
+        }
+        // Now capture game running
+        loop {
+            match conn.recv(&mut buf) {
+                Ok(event) => {
+                    match event {
+                        ProcEvent::Exec { pid, .. } => {
+                            if let Some(ppid) = get_proc_parent(pid) {
+                                if ppid == steam_launcher_pid {
+                                    if get_proc_comm(pid).map_or(false, |s| s.contains("steam-runtime")) {
+                                        GAME_PROC.lock().unwrap().push(pid);
+                                        on_game_start();
+                                        log!("Game {pid} started");
+                                    }
+                                } else if ppid == steam_client_pid {
+                                    if get_proc_comm(pid).map_or(false, |s| s.eq("steamwebhelper")) {
+                                        if BLOCK_WEBHELPER.load(Ordering::Relaxed) {
+                                            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                                        } else {
+                                            // We only store the root process of steam web helper
+                                            // Term the root process kills all of them
+                                            WEBHELPER_PID.store(pid, Ordering::Relaxed);
+                                            log!("webhelper_pid is {}", pid);
                                         }
                                     }
                                 }
@@ -128,13 +147,7 @@ fn start_proc_connector() {
                                     false
                                 }
                             }
-                            if steam_client_pid == 0 || steam_launcher_pid == 0 {
-                                if launching_pids.remove(&pid) && launching_pids.len() == 1 {
-                                    // All steam processes exited
-                                    continue_main();
-                                    return;
-                                }
-                            } else if parent_pid == steam_client_pid && pid == WEBHELPER_PID.load(Ordering::Relaxed) {
+                            if parent_pid == steam_client_pid && pid == WEBHELPER_PID.load(Ordering::Relaxed) {
                                 WEBHELPER_PID.store(0, Ordering::Relaxed);
                                 log!("webhelper_pid {pid} exited");
                             } else if parent_pid == steam_launcher_pid {
