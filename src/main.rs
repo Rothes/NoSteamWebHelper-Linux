@@ -87,6 +87,11 @@ impl ksni::Tray for ProgramTray {
                 ..Default::default()
             }.into(),
             StandardItem {
+                label: "Exit Tray".into(),
+                activate: Box::new(|_| { TRAY_ICON.lock().unwrap().take().unwrap().shutdown(); }),
+                ..Default::default()
+            }.into(),
+            StandardItem {
                 label: "Exit Steam".into(),
                 activate: Box::new(|_| term_steam()),
                 ..Default::default()
@@ -262,6 +267,16 @@ fn start_proc_connector() {
 }
 
 fn start_tray() {
+    match std::env::var("DISABLE_NOSTEAMWEBHELPER_TRAY") {
+        Ok(value) => {
+            if value == "1" || value == "true" {
+                log!("DISABLE_NOSTEAMWEBHELPER_TRAY env is true");
+                return;
+            }
+        }
+        Err(_) => {}
+    }
+
     use ksni::blocking::TrayMethods;
     if let Ok(tray) = ProgramTray::new().spawn() {
         let mut guard = TRAY_ICON.lock().unwrap();
