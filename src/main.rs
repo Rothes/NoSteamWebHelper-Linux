@@ -262,13 +262,11 @@ fn start_proc_connector() {
 }
 
 fn start_tray() {
-    std::thread::spawn(|| {
-        use ksni::blocking::TrayMethods;
-        if let Ok(tray) = ProgramTray::new().spawn() {
-            let mut guard = TRAY_ICON.lock().unwrap();
-            *guard = Some(tray);
-        }
-    });
+    use ksni::blocking::TrayMethods;
+    if let Ok(tray) = ProgramTray::new().spawn() {
+        let mut guard = TRAY_ICON.lock().unwrap();
+        *guard = Some(tray);
+    }
 }
 
 fn update_tray() {
