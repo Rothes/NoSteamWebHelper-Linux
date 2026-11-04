@@ -8,6 +8,7 @@ use std::thread::{Thread, park};
 static STEAM_ROOT_PID: AtomicU32 = AtomicU32::new(0);
 static STEAM_CLIENT_PID: AtomicU32 = AtomicU32::new(0);
 static WEBHELPER_PID: AtomicU32 = AtomicU32::new(0);
+static GAME_OVERLAY_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 static FROZEN_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -200,15 +201,25 @@ fn start_proc_connector() {
                                         log!("Game {pid} started");
                                     }
                                 } else if ppid == steam_client_pid {
-                                    if get_proc_comm(pid).map_or(false, |s| s.eq("steamwebhelper")) {
-                                        if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
-                                            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-                                        } else {
-                                            // We only store the root process of steam web helper
-                                            // Term the root process kills all of them
-                                            WEBHELPER_PID.store(pid, Ordering::Relaxed);
-                                            log!("webhelper_pid is {}", pid);
+                                    match get_proc_comm(pid).unwrap().as_str() {
+                                        "steamwebhelper" => {
+                                            if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
+                                                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                                            } else {
+                                                // We only store the root process of steam web helper
+                                                // Term the root process kills all of them
+                                                WEBHELPER_PID.store(pid, Ordering::Relaxed);
+                                                log!("webhelper_pid is {pid}");
+                                            }
                                         }
+                                        "gameoverlayui" => {
+                                            GAME_OVERLAY_PROC.lock().unwrap().push(pid);
+                                            log!("gameoverlayui {pid} started");
+                                            if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
+                                                freeze_pid(pid)
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -223,9 +234,13 @@ fn start_proc_connector() {
                                     false
                                 }
                             }
-                            if parent_pid == steam_client_pid && pid == WEBHELPER_PID.load(Ordering::Relaxed) {
-                                WEBHELPER_PID.store(0, Ordering::Relaxed);
-                                log!("webhelper_pid {pid} exited");
+                            if parent_pid == steam_client_pid {
+                                if pid == WEBHELPER_PID.load(Ordering::Relaxed) {
+                                    WEBHELPER_PID.store(0, Ordering::Relaxed);
+                                    log!("webhelper_pid {pid} exited");
+                                } else if rm_elem(&GAME_OVERLAY_PROC, pid) {
+                                    log!("gameoverlayui {pid} exited");
+                                }
                             } else if parent_pid == steam_launcher_pid {
                                 if rm_elem(&GAME_PROC, pid) {
                                     log!("Game {pid} exited");
@@ -347,6 +362,9 @@ fn start_game_mode() {
     if BLOCKING_WEBHELPER.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         log!("Starting game mode");
         kill_cef();
+        GAME_OVERLAY_PROC.lock().unwrap().iter().for_each(|pid| {
+            freeze_pid(*pid);
+        });
         update_tray()
     }
 }
@@ -371,10 +389,19 @@ fn update_tray_options() {
     });
 }
 
+fn freeze_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGSTOP);
+    }
+    FROZEN_PROC.lock().unwrap().push(pid);
+    log!("Freeze pid {pid}");
+}
+
 fn continue_frozen() {
-    let mut wh = FROZEN_PROC.lock().unwrap();
-    wh.iter().for_each(|&pid| {
+    let mut frozen = FROZEN_PROC.lock().unwrap();
+    frozen.iter().for_each(|&pid| {
         unsafe { libc::kill(pid as i32, libc::SIGCONT); }
+        log!("Continue pid {pid}");
     });
-    wh.clear();
+    frozen.clear();
 }
