@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{Thread, park};
 
-static STEAM_ROOT_PID: AtomicU32 = AtomicU32::new(0);
 static STEAM_CLIENT_PID: AtomicU32 = AtomicU32::new(0);
 static WEBHELPER_PID: AtomicU32 = AtomicU32::new(0);
 
@@ -324,7 +323,6 @@ fn get_proc_comm(pid: u32) -> Option<String> {
 
 fn launch_steam() {
     let child = Command::new("/usr/bin/steam").args(std::env::args().skip(1)).spawn().expect("Failed to launch steam");
-    STEAM_ROOT_PID.store(child.id(), Ordering::Relaxed);
     log!("Launching steam steam pid {}", child.id());
 }
 
