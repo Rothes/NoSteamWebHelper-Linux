@@ -107,10 +107,9 @@ macro_rules! err {
 }
 
 fn main() {
-    {
-        let mut guard = MAIN_THREAD.lock().unwrap();
-        *guard = Some(std::thread::current());
-    }
+    let mut guard = MAIN_THREAD.lock().unwrap();
+    *guard = Some(std::thread::current());
+    drop(guard);
     start_proc_connector();
     launch_steam();
 
