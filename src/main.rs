@@ -8,17 +8,17 @@ use std::thread::{Thread, park};
 static STEAM_ROOT_PID: AtomicU32 = AtomicU32::new(0);
 static STEAM_CLIENT_PID: AtomicU32 = AtomicU32::new(0);
 static WEBHELPER_PID: AtomicU32 = AtomicU32::new(0);
-static GAME_OVERLAY_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-static FROZEN_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static GAME_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static GAME_OVERLAY_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-static GAME_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static FROZEN_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-static DISABLE_CEF_ON_GAME_MODE: AtomicBool = AtomicBool::new(true);
-static BLOCKING_WEBHELPER: AtomicBool = AtomicBool::new(false);
+static DISABLE_CEF_ON_GAMING: AtomicBool = AtomicBool::new(true);
+static ACTIVATED_GAME_MODE: AtomicBool = AtomicBool::new(false);
 
 static MAIN_THREAD: Mutex<Option<Thread>> = Mutex::new(None);
-static TRAY_ICON: Mutex<Option<ksni::blocking::Handle<ProgramTray>>> = Mutex::new(None);
+static TRAY_INSTANCE: Mutex<Option<ksni::blocking::Handle<ProgramTray>>> = Mutex::new(None);
 
 struct ProgramTray;
 impl ProgramTray {
@@ -60,9 +60,9 @@ impl ksni::Tray for ProgramTray {
                 data,
             }
         }
-        let color = if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
+        let color = if ACTIVATED_GAME_MODE.load(Ordering::Relaxed) {
             [46, 204, 113, 255]
-        } else if DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed) {
+        } else if DISABLE_CEF_ON_GAMING.load(Ordering::Relaxed) {
             [241, 196, 15, 255]
         } else {
             [149, 165, 166, 255]
@@ -77,7 +77,7 @@ impl ksni::Tray for ProgramTray {
         vec![
             CheckmarkItem {
                 label: "Disable CEF On Gaming".into(),
-                checked: DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed),
+                checked: DISABLE_CEF_ON_GAMING.load(Ordering::Relaxed),
                 activate: Box::new(|_| update_tray_options()),
                 ..Default::default()
             }.into(),
@@ -88,7 +88,7 @@ impl ksni::Tray for ProgramTray {
             }.into(),
             StandardItem {
                 label: "Exit Tray".into(),
-                activate: Box::new(|_| { TRAY_ICON.lock().unwrap().take().unwrap().shutdown(); }),
+                activate: Box::new(|_| { TRAY_INSTANCE.lock().unwrap().take().unwrap().shutdown(); }),
                 ..Default::default()
             }.into(),
             StandardItem {
@@ -201,14 +201,14 @@ fn start_proc_connector() {
                             if let Some(ppid) = get_proc_parent(pid) {
                                 if ppid == steam_launcher_pid {
                                     if get_proc_comm(pid).map_or(false, |s| s.contains("steam-runtime")) {
-                                        GAME_PROC.lock().unwrap().push(pid);
+                                        GAME_PIDS.lock().unwrap().push(pid);
                                         on_game_start();
                                         log!("Game {pid} started");
                                     }
                                 } else if ppid == steam_client_pid {
                                     match get_proc_comm(pid).unwrap().as_str() {
                                         "steamwebhelper" => {
-                                            if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
+                                            if ACTIVATED_GAME_MODE.load(Ordering::Relaxed) {
                                                 unsafe { libc::kill(pid as i32, libc::SIGKILL); }
                                             } else {
                                                 // We only store the root process of steam web helper
@@ -218,9 +218,9 @@ fn start_proc_connector() {
                                             }
                                         }
                                         "gameoverlayui" => {
-                                            GAME_OVERLAY_PROC.lock().unwrap().push(pid);
+                                            GAME_OVERLAY_PIDS.lock().unwrap().push(pid);
                                             log!("gameoverlayui {pid} started");
-                                            if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
+                                            if ACTIVATED_GAME_MODE.load(Ordering::Relaxed) {
                                                 freeze_pid(pid)
                                             }
                                         }
@@ -243,11 +243,11 @@ fn start_proc_connector() {
                                 if pid == WEBHELPER_PID.load(Ordering::Relaxed) {
                                     WEBHELPER_PID.store(0, Ordering::Relaxed);
                                     log!("webhelper_pid {pid} exited");
-                                } else if rm_elem(&GAME_OVERLAY_PROC, pid) {
+                                } else if rm_elem(&GAME_OVERLAY_PIDS, pid) {
                                     log!("gameoverlayui {pid} exited");
                                 }
                             } else if parent_tgid == steam_launcher_pid {
-                                if rm_elem(&GAME_PROC, pid) {
+                                if rm_elem(&GAME_PIDS, pid) {
                                     log!("Game {pid} exited");
                                     on_game_exit();
                                 }
@@ -279,13 +279,13 @@ fn start_tray() {
 
     use ksni::blocking::TrayMethods;
     if let Ok(tray) = ProgramTray::new().spawn() {
-        let mut guard = TRAY_ICON.lock().unwrap();
+        let mut guard = TRAY_INSTANCE.lock().unwrap();
         *guard = Some(tray);
     }
 }
 
 fn update_tray() {
-    if let Some(tray) = TRAY_ICON.lock().unwrap().as_ref() {
+    if let Some(tray) = TRAY_INSTANCE.lock().unwrap().as_ref() {
         tray.update(|_| {}); // Update tray icon
     }
 }
@@ -356,7 +356,7 @@ fn cleanup() {
 }
 
 fn on_game_start() {
-    if DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed) && start_game_mode() {
+    if DISABLE_CEF_ON_GAMING.load(Ordering::Relaxed) && start_game_mode() {
         update_tray()
     }
 }
@@ -368,14 +368,14 @@ fn on_game_exit() {
 }
 
 fn is_no_game_process() -> bool {
-    GAME_PROC.lock().unwrap().is_empty()
+    GAME_PIDS.lock().unwrap().is_empty()
 }
 
 fn start_game_mode() -> bool {
-    if BLOCKING_WEBHELPER.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+    if ACTIVATED_GAME_MODE.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         log!("Starting game mode");
         kill_cef();
-        GAME_OVERLAY_PROC.lock().unwrap().iter().for_each(|pid| {
+        GAME_OVERLAY_PIDS.lock().unwrap().iter().for_each(|pid| {
             freeze_pid(*pid);
         });
         true
@@ -383,7 +383,7 @@ fn start_game_mode() -> bool {
 }
 
 fn stop_game_mode() -> bool {
-    if BLOCKING_WEBHELPER.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+    if ACTIVATED_GAME_MODE.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         log!("Exiting game mode");
         continue_frozen();
         true
@@ -391,7 +391,7 @@ fn stop_game_mode() -> bool {
 }
 
 fn update_tray_options() {
-    let old = DISABLE_CEF_ON_GAME_MODE.fetch_xor(true, Ordering::Relaxed);
+    let old = DISABLE_CEF_ON_GAMING.fetch_xor(true, Ordering::Relaxed);
     if old {
         stop_game_mode();
     } else if !is_no_game_process() {
@@ -403,12 +403,12 @@ fn freeze_pid(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGSTOP);
     }
-    FROZEN_PROC.lock().unwrap().push(pid);
+    FROZEN_PIDS.lock().unwrap().push(pid);
     log!("Freeze pid {pid}");
 }
 
 fn continue_frozen() {
-    let mut frozen = FROZEN_PROC.lock().unwrap();
+    let mut frozen = FROZEN_PIDS.lock().unwrap();
     frozen.iter().for_each(|&pid| {
         unsafe { libc::kill(pid as i32, libc::SIGCONT); }
         log!("Continue pid {pid}");
