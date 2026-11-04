@@ -8,3 +8,4 @@ libc = "0.2"
 dbus = "0.9.12"
 ctrlc = "3.5.2"
 proc-connector = "0.3.0"
+ksni = { version = "0.3", features = ["blocking"] }

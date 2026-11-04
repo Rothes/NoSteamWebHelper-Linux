@@ -13,9 +13,86 @@ static FROZEN_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 static GAME_PROC: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-static BLOCK_WEBHELPER: AtomicBool = AtomicBool::new(false);
+static DISABLE_CEF_ON_GAME_MODE: AtomicBool = AtomicBool::new(true);
+static BLOCKING_WEBHELPER: AtomicBool = AtomicBool::new(false);
 
 static MAIN_THREAD: Mutex<Option<Thread>> = Mutex::new(None);
+static TRAY_ICON: Mutex<Option<ksni::blocking::Handle<ProgramTray>>> = Mutex::new(None);
+
+struct ProgramTray;
+impl ProgramTray {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl ksni::Tray for ProgramTray {
+    fn id(&self) -> String {
+        env!("CARGO_PKG_NAME").into()
+    }
+    fn title(&self) -> String {
+        "Steam-NoSteamWebHelper".into()
+    }
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        use ksni::Icon;
+        fn create_icon(size: u32, color: [u8; 4]) -> Icon {
+            let mut data = Vec::with_capacity((size * size * 4) as usize);
+            let center = size as f32 / 2.0;
+            let radius = center * 0.6;
+
+            for y in 0..size {
+                for x in 0..size {
+                    let dx = x as f32 + 0.5 - center;
+                    let dy = y as f32 + 0.5 - center;
+                    let distance = (dx * dx + dy * dy).sqrt();
+
+                    let alpha = ((radius + 0.5 - distance).clamp(0.0, 1.0)
+                        * color[3] as f32) as u8;
+
+                    data.extend_from_slice(&[alpha, color[0], color[1], color[2]]);
+                }
+            }
+
+            Icon {
+                width: size as i32,
+                height: size as i32,
+                data,
+            }
+        }
+        let color = if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
+            [46, 204, 113, 255]
+        } else if DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed) {
+            [241, 196, 15, 255]
+        } else {
+            [149, 165, 166, 255]
+        };
+        vec![
+            create_icon(64, color),
+            create_icon(32, color),
+        ]
+    }
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::*;
+        vec![
+            CheckmarkItem {
+                label: "Disable CEF On Gaming".into(),
+                checked: DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed),
+                activate: Box::new(|_| update_tray_options()),
+                ..Default::default()
+            }.into(),
+            StandardItem {
+                label: "Restart CEF".into(),
+                activate: Box::new(|_| kill_cef()),
+                ..Default::default()
+            }.into(),
+            StandardItem {
+                label: "Exit Steam".into(),
+                activate: Box::new(|_| term_steam()),
+                ..Default::default()
+            }.into(),
+        ]
+    }
+}
 
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -85,7 +162,6 @@ fn start_proc_connector() {
                                                         steam_client_pid = pid;
                                                         STEAM_CLIENT_PID.store(pid, Ordering::Relaxed);
                                                         log!("steam_client_pid is {}", pid);
-                                                        drop(launching_pids);
                                                         break
                                                     }
                                                 }
@@ -109,6 +185,8 @@ fn start_proc_connector() {
                 Err(e) => { err!("error: {e:?}"); }
             }
         }
+        drop(launching_pids);
+        start_tray();
         // Now capture game running
         loop {
             match conn.recv(&mut buf) {
@@ -124,7 +202,7 @@ fn start_proc_connector() {
                                     }
                                 } else if ppid == steam_client_pid {
                                     if get_proc_comm(pid).map_or(false, |s| s.eq("steamwebhelper")) {
-                                        if BLOCK_WEBHELPER.load(Ordering::Relaxed) {
+                                        if BLOCKING_WEBHELPER.load(Ordering::Relaxed) {
                                             unsafe { libc::kill(pid as i32, libc::SIGKILL); }
                                         } else {
                                             // We only store the root process of steam web helper
@@ -169,6 +247,21 @@ fn start_proc_connector() {
     });
 }
 
+fn start_tray() {
+    std::thread::spawn(|| {
+        use ksni::blocking::TrayMethods;
+        if let Ok(tray) = ProgramTray::new().spawn() {
+            let mut guard = TRAY_ICON.lock().unwrap();
+            *guard = Some(tray);
+        }
+    });
+}
+
+fn update_tray() {
+    if let Some(tray) = TRAY_ICON.lock().unwrap().as_ref() {
+        tray.update(|_| {}); // Update tray icon
+    }
+}
 
 fn get_proc_parent(pid: u32) -> Option<u32> {
     let path = format!("/proc/{}/stat", pid);
@@ -209,34 +302,74 @@ fn launch_steam() {
 }
 
 fn continue_main() {
-    if let Some(thread) = MAIN_THREAD.lock().unwrap().clone() {
+    if let Some(thread) = MAIN_THREAD.lock().unwrap().as_ref() {
         thread.unpark();
     }
 }
 
-fn cleanup() {
-    log!("Running cleanup");
-    continue_frozen();
+fn kill_cef() {
+    let webhelper_pid = WEBHELPER_PID.load(Ordering::Relaxed);
+    if webhelper_pid != 0 {
+        unsafe { libc::kill(webhelper_pid as i32, libc::SIGKILL); }
+        // ProcConnector will capture the proc exit, no need to set to zero
+    }
+}
+
+fn term_steam() {
     let pid = STEAM_CLIENT_PID.load(Ordering::Relaxed);
     if pid != 0 {
         unsafe { libc::kill(pid as i32, libc::SIGTERM); }
     }
 }
 
+fn cleanup() {
+    log!("Running cleanup");
+    continue_frozen();
+    term_steam()
+}
+
 fn on_game_start() {
-    if BLOCK_WEBHELPER.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        log!("Starting game mode");
-        let webhelper_pid = WEBHELPER_PID.load(Ordering::Relaxed);
-        unsafe { libc::kill(webhelper_pid as i32, libc::SIGTERM); }
-        // ProcConnector will capture the proc exit
+    if DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed) {
+        start_game_mode()
     }
 }
 
 fn on_game_exit() {
-    if GAME_PROC.lock().unwrap().is_empty() && BLOCK_WEBHELPER.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        log!("Exiting game mode");
-        continue_frozen()
+    if is_no_game_process() {
+        stop_game_mode()
     }
+}
+
+fn is_no_game_process() -> bool {
+    GAME_PROC.lock().unwrap().is_empty()
+}
+
+fn start_game_mode() {
+    if BLOCKING_WEBHELPER.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        log!("Starting game mode");
+        kill_cef();
+        update_tray()
+    }
+}
+
+fn stop_game_mode() {
+    if BLOCKING_WEBHELPER.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        log!("Exiting game mode");
+        continue_frozen();
+        update_tray()
+    }
+}
+
+fn update_tray_options() {
+    // Spawn a new thread, otherwise activate update will override game_mode tray updates
+    std::thread::spawn(|| {
+        let old = DISABLE_CEF_ON_GAME_MODE.fetch_xor(true, Ordering::Relaxed);
+        if old {
+            stop_game_mode()
+        } else if !is_no_game_process() {
+            on_game_start()
+        }
+    });
 }
 
 fn continue_frozen() {
