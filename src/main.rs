@@ -1,6 +1,5 @@
 use proc_connector::{EventMask, ProcConnector, ProcEvent};
 use std::collections::HashSet;
-use std::process;
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -58,7 +57,7 @@ fn start_proc_connector() {
     let mut buf = vec![0u8; 4096];
 
     let mut launching_pids: HashSet<u32> = HashSet::new();
-    launching_pids.insert(process::id());
+    launching_pids.insert(std::process::id());
     let mut steam_client_pid = 0u32; // no-steam-webhelper -> bash -> steam -> srt-client-container -> srt-bwrap -> pv-adverb -> steam
     let mut steam_launcher_pid = 0u32;
 
@@ -152,8 +151,8 @@ fn start_proc_connector() {
                                 log!("webhelper_pid {pid} exited");
                             } else if parent_pid == steam_launcher_pid {
                                 if rm_elem(&GAME_PROC, pid) {
-                                    on_game_exit();
                                     log!("Game {pid} exited");
+                                    on_game_exit();
                                 }
                             } else if pid == steam_client_pid {
                                 log!("Steam client {pid} exited");
