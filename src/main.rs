@@ -343,14 +343,14 @@ fn cleanup() {
 }
 
 fn on_game_start() {
-    if DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed) {
-        start_game_mode()
+    if DISABLE_CEF_ON_GAME_MODE.load(Ordering::Relaxed) && start_game_mode() {
+        update_tray()
     }
 }
 
 fn on_game_exit() {
-    if is_no_game_process() {
-        stop_game_mode()
+    if is_no_game_process() && stop_game_mode() {
+        update_tray()
     }
 }
 
@@ -358,35 +358,32 @@ fn is_no_game_process() -> bool {
     GAME_PROC.lock().unwrap().is_empty()
 }
 
-fn start_game_mode() {
+fn start_game_mode() -> bool {
     if BLOCKING_WEBHELPER.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         log!("Starting game mode");
         kill_cef();
         GAME_OVERLAY_PROC.lock().unwrap().iter().for_each(|pid| {
             freeze_pid(*pid);
         });
-        update_tray()
-    }
+        true
+    } else { false }
 }
 
-fn stop_game_mode() {
+fn stop_game_mode() -> bool {
     if BLOCKING_WEBHELPER.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         log!("Exiting game mode");
         continue_frozen();
-        update_tray()
-    }
+        true
+    } else { false }
 }
 
 fn update_tray_options() {
-    // Spawn a new thread, otherwise activate update will override game_mode tray updates
-    std::thread::spawn(|| {
-        let old = DISABLE_CEF_ON_GAME_MODE.fetch_xor(true, Ordering::Relaxed);
-        if old {
-            stop_game_mode()
-        } else if !is_no_game_process() {
-            on_game_start()
-        }
-    });
+    let old = DISABLE_CEF_ON_GAME_MODE.fetch_xor(true, Ordering::Relaxed);
+    if old {
+        stop_game_mode();
+    } else if !is_no_game_process() {
+        start_game_mode();
+    }
 }
 
 fn freeze_pid(pid: u32) {
