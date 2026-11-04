@@ -224,7 +224,7 @@ fn start_proc_connector() {
                                 }
                             }
                         }
-                        ProcEvent::Exit { parent_pid, pid, .. } => {
+                        ProcEvent::Exit { parent_tgid, pid, .. } => {
                             fn rm_elem(pids: &Mutex<Vec<u32>>, pid: u32) -> bool {
                                 let mut vec = pids.lock().unwrap();
                                 if let Some(pos) = vec.iter().position(|&x| x == pid) {
@@ -234,14 +234,14 @@ fn start_proc_connector() {
                                     false
                                 }
                             }
-                            if parent_pid == steam_client_pid {
+                            if parent_tgid == steam_client_pid {
                                 if pid == WEBHELPER_PID.load(Ordering::Relaxed) {
                                     WEBHELPER_PID.store(0, Ordering::Relaxed);
                                     log!("webhelper_pid {pid} exited");
                                 } else if rm_elem(&GAME_OVERLAY_PROC, pid) {
                                     log!("gameoverlayui {pid} exited");
                                 }
-                            } else if parent_pid == steam_launcher_pid {
+                            } else if parent_tgid == steam_launcher_pid {
                                 if rm_elem(&GAME_PROC, pid) {
                                     log!("Game {pid} exited");
                                     on_game_exit();
