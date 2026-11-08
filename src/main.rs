@@ -398,10 +398,11 @@ fn update_tray_options() {
 }
 
 fn freeze_pid(pid: u32) {
+    let mut frozen = FROZEN_PIDS.lock().unwrap();
     unsafe {
         libc::kill(pid as i32, libc::SIGSTOP);
     }
-    FROZEN_PIDS.lock().unwrap().push(pid);
+    frozen.push(pid);
     log!("Freeze pid {pid}");
 }
 
