@@ -1,14 +1,13 @@
 mod proc_utils;
 mod program_tray;
+mod proc_monitor;
 
-use proc_connector::{EventMask, ProcConnector, ProcEvent};
-use std::collections::HashSet;
+use crate::proc_monitor::start_proc_connector;
+use crate::program_tray::update_tray;
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{Thread, park};
-use crate::program_tray::*;
-use crate::proc_utils::*;
 
 static STEAM_CLIENT_PID: AtomicU32 = AtomicU32::new(0);
 static WEBHELPER_PID: AtomicU32 = AtomicU32::new(0);
@@ -54,144 +53,9 @@ fn main() {
     log!("Program exits");
 }
 
-fn start_proc_connector() {
-    let conn = ProcConnector::new().expect("failed to create process connector");
-    if let Err(e) = conn.subscribe_filtered(EventMask::EXEC | EventMask::EXIT) {
-        err!("Failed to set EventMask: {}", e);
-    }
-    let mut buf = vec![0u8; 4096];
-
-    let mut launching_pids: HashSet<u32> = HashSet::new();
-    launching_pids.insert(std::process::id());
-    let mut steam_client_pid = 0u32; // no-steam-webhelper -> bash -> steam -> srt-client-container -> srt-bwrap -> pv-adverb -> steam
-    let mut steam_launcher_pid = 0u32;
-
-    std::thread::spawn(move || {
-        // Catch steam pid
-        loop {
-            match conn.recv(&mut buf) {
-                Ok(event) => {
-                    match event {
-                        ProcEvent::Exec { pid, .. } => {
-                            if let Some(ppid) = get_proc_parent(pid) {
-                                if launching_pids.contains(&ppid) {
-                                    launching_pids.insert(pid);
-                                    if let Some(comm) = get_proc_comm(pid) {
-                                        match comm.as_str() {
-                                            "x86_64-linux-gn" /* x86_64-linux-gnu-srt-launcher-service */ => {
-                                                if steam_launcher_pid == 0 {
-                                                    steam_launcher_pid = pid;
-                                                    log!("steam_launcher_pid is {}", pid);
-                                                }
-                                            }
-                                            "steam" => {
-                                                if let Some(ppid) = get_proc_parent(pid) && get_proc_comm(ppid) == Some("pv-adverb".to_string()) {
-                                                    if steam_client_pid == 0 {
-                                                        steam_client_pid = pid;
-                                                        STEAM_CLIENT_PID.store(pid, Ordering::Relaxed);
-                                                        log!("steam_client_pid is {}", pid);
-                                                        break
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        ProcEvent::Exit { pid, .. } => {
-                            if launching_pids.remove(&pid) && launching_pids.len() == 1 {
-                                // All steam processes exited
-                                continue_main();
-                                return;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Err(e) => { err!("error: {e:?}"); }
-            }
-        }
-        drop(launching_pids);
-        start_tray();
-        // Now capture game running
-        loop {
-            match conn.recv(&mut buf) {
-                Ok(event) => {
-                    match event {
-                        ProcEvent::Exec { pid, .. } => {
-                            if let Some(ppid) = get_proc_parent(pid) {
-                                if ppid == steam_launcher_pid {
-                                    if get_proc_comm(pid).map_or(false, |s| s.contains("steam-runtime")) {
-                                        GAME_PIDS.lock().unwrap().push(pid);
-                                        on_game_start();
-                                        log!("Game {pid} started");
-                                    }
-                                } else if ppid == steam_client_pid {
-                                    match get_proc_comm(pid).unwrap().as_str() {
-                                        "steamwebhelper" => {
-                                            if ACTIVATED_GAME_MODE.load(Ordering::Relaxed) {
-                                                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-                                            } else {
-                                                // We only store the root process of steam web helper
-                                                // Term the root process kills all of them
-                                                WEBHELPER_PID.store(pid, Ordering::Relaxed);
-                                                log!("webhelper_pid is {pid}");
-                                            }
-                                        }
-                                        "gameoverlayui" => {
-                                            GAME_OVERLAY_PIDS.lock().unwrap().push(pid);
-                                            log!("gameoverlayui {pid} started");
-                                            if ACTIVATED_GAME_MODE.load(Ordering::Relaxed) {
-                                                freeze_pid(pid)
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        ProcEvent::Exit { parent_tgid, pid, .. } => {
-                            fn rm_elem(pids: &Mutex<Vec<u32>>, pid: u32) -> bool {
-                                let mut vec = pids.lock().unwrap();
-                                if let Some(pos) = vec.iter().position(|&x| x == pid) {
-                                    vec.remove(pos);
-                                    true
-                                } else {
-                                    false
-                                }
-                            }
-                            if parent_tgid == steam_client_pid {
-                                if pid == WEBHELPER_PID.load(Ordering::Relaxed) {
-                                    WEBHELPER_PID.store(0, Ordering::Relaxed);
-                                    log!("webhelper_pid {pid} exited");
-                                } else if rm_elem(&GAME_OVERLAY_PIDS, pid) {
-                                    log!("gameoverlayui {pid} exited");
-                                }
-                            } else if parent_tgid == steam_launcher_pid {
-                                if rm_elem(&GAME_PIDS, pid) {
-                                    log!("Game {pid} exited");
-                                    on_game_exit();
-                                }
-                            } else if pid == steam_client_pid {
-                                log!("Steam client {pid} exited");
-                                continue_main();
-                                return;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Err(e) => { err!("error: {e:?}"); }
-            }
-        }
-    });
-}
-
 fn launch_steam() {
     let child = Command::new("/usr/bin/steam").args(std::env::args().skip(1)).spawn().expect("Failed to launch steam");
-    log!("Launching steam steam pid {}", child.id());
+    log!("Launching steam launcher script, pid {}", child.id());
 }
 
 fn continue_main() {
@@ -221,6 +85,10 @@ fn cleanup() {
     term_steam()
 }
 
+fn is_no_game_process() -> bool {
+    GAME_PIDS.lock().unwrap().is_empty()
+}
+
 fn on_game_start() {
     if DISABLE_CEF_ON_GAMING.load(Ordering::Relaxed) && start_game_mode() {
         update_tray()
@@ -231,10 +99,6 @@ fn on_game_exit() {
     if is_no_game_process() && stop_game_mode() {
         update_tray()
     }
-}
-
-fn is_no_game_process() -> bool {
-    GAME_PIDS.lock().unwrap().is_empty()
 }
 
 fn start_game_mode() -> bool {
