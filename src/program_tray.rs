@@ -85,10 +85,10 @@ impl ksni::Tray for ProgramTray {
 }
 
 pub fn start_tray() {
-    match std::env::var("DISABLE_NOSTEAMWEBHELPER_TRAY") {
+    match std::env::var("NOSTEAMWEBHELPER_DISABLE_TRAY") {
         Ok(value) => {
             if value == "1" || value == "true" {
-                crate::log!("DISABLE_NOSTEAMWEBHELPER_TRAY env is true");
+                crate::log!("NOSTEAMWEBHELPER_DISABLE_TRAY env is true");
                 return;
             }
         }
